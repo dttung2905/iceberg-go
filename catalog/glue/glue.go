@@ -27,6 +27,7 @@ import (
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/catalog/internal"
 	"github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/apache/iceberg-go/utils"
@@ -228,10 +229,57 @@ func (c *Catalog) CatalogType() catalog.Type {
 	return catalog.Glue
 }
 
-func (c *Catalog) CreateTable(ctx context.Context, identifier table.Identifier, schema *iceberg.Schema, opts ...catalog.CreateTableOpt) (*table.Table, error) {
-	panic("create table not implemented for Glue Catalog")
+func schemaToGlueColumns(schema *iceberg.Schema) []types.Column {
+	var columns []types.Column
+	for _, field := range schema.Fields() {
+		columns = append(columns, types.Column{
+			Name:    aws.String(field.Name),
+			Type:    aws.String(field.String()), // Is this the correct method to call?
+			Comment: aws.String(field.Doc),
+		})
+	}
+	return columns
 }
-
+func (c *Catalog) CreateTable(ctx context.Context, identifier table.Identifier, schema *iceberg.Schema, opts ...catalog.CreateTableOpt) (*table.Table, error) {
+	databaseName, tableName, err := identifierToGlueTable(identifier)
+	if err != nil {
+		return nil, err
+	}
+	var cfg internal.CreateTableCfg
+	for _, o := range opts {
+		o(&cfg)
+	}
+	// Create storage descriptor with schema
+	storageDesc := &types.StorageDescriptor{
+		Columns:      schemaToGlueColumns(schema),
+		Location:     aws.String(cfg.Location),
+		InputFormat:  aws.String("org.apache.iceberg.mr.hive.HiveIcebergInputFormat"),  // Double check this
+		OutputFormat: aws.String("org.apache.iceberg.mr.hive.HiveIcebergOutputFormat"), // Double check this
+		SerdeInfo: &types.SerDeInfo{
+			SerializationLibrary: aws.String("org.apache.iceberg.mr.SerDe"), // Double check this
+		},
+	}
+	_, err = c.glueSvc.CreateTable(ctx, &glue.CreateTableInput{
+		CatalogId:    c.catalogId,
+		DatabaseName: aws.String(databaseName),
+		TableInput: &types.TableInput{
+			Name: aws.String(tableName),
+			// Where should we get the following information?
+			//Owner
+			//Description
+			Parameters:        cfg.Properties,
+			StorageDescriptor: storageDesc,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	newTable, err := c.LoadTable(ctx, TableIdentifier(databaseName, tableName), nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load table %s: %w", tableName, err)
+	}
+	return newTable, nil
+}
 func (c *Catalog) CommitTable(context.Context, *table.Table, []table.Requirement, []table.Update) (table.Metadata, string, error) {
 	panic("commit table not implemented for Glue Catalog")
 }
